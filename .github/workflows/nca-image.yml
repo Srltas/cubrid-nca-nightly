@@ -1,0 +1,273 @@
+#
+# NCA test image
+#
+# Packages the CUBRID build published for NCA testing as a container image and
+# publishes it to GHCR. The engine is not rebuilt: the package comes from
+# ftp.cubrid.org/cubrid_dev/NCA_Nightly/ and is put into the image defined here.
+#
+# Manual only. This exists to test NCA against a specific CUBRID build, not to
+# run unattended, so there is no schedule to go stale or to be ignored.
+#
+# Tags
+#   <build id>   immutable, pushed once per build even if the smoke test fails,
+#                so a broken build stays available for investigation
+#   nightly      moves to the newest build that PASSED the smoke test
+#   latest       alias of nightly
+#
+# Unlike the engine nightly, the source directory ships a single tarball and no
+# hash.md5, so the download cannot be checked against a published digest. The
+# run records the file's size and md5 in its summary instead, which is enough to
+# tell whether the upstream file changed between runs.
+#
+name: NCA test image
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if the immutable tag already exists'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {} # Least privilege, jobs opt in below
+
+concurrency:
+  group: nca-image
+  cancel-in-progress: false # never interrupt a push or a version delete
+
+env:
+  FTP_DIR: https://ftp.cubrid.org/cubrid_dev/NCA_Nightly
+  IMAGE_NAME: cubrid-nca-nightly
+  # The source keeps no history, so an image we publish is the only remaining
+  # copy of that build. Keep more of them than the engine nightly does.
+  KEEP_VERSIONS: 30
+  GHCR_ACCEPT: 'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve the build on ftp
+        id: target
+        env:
+          OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The directory holds one tarball whose name carries the build id.
+          # grep is wrapped so an empty match reaches the guard below rather
+          # than dying on pipefail with no annotation; curl stays its own
+          # pipeline element so a transport failure still propagates.
+          mapfile -t files < <(curl -fsSL --retry 5 --retry-delay 10 \
+              --retry-all-errors --max-time 120 "$FTP_DIR/" \
+            | { grep -oE 'href="CUBRID-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{7,40}-Linux\.x86_64\.tar\.gz"' || true; } \
+            | sed -E 's#^href="(.+)"$#\1#' | sort -u -V)
+          [ "${#files[@]}" -gt 0 ] \
+            || { echo "::error::no CUBRID tarball found at $FTP_DIR/ (naming changed?)"; exit 1; }
+          if [ "${#files[@]}" -gt 1 ]; then
+            echo "::warning::${#files[@]} tarballs present, taking the highest version"
+            printf '  %s\n' "${files[@]}"
+          fi
+          tarball=${files[-1]}
+          build_id=${tarball#CUBRID-}
+          build_id=${build_id%-Linux.x86_64.tar.gz}
+          owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "tarball=$tarball"
+            echo "build_id=$build_id"
+            echo "repo=$owner/$IMAGE_NAME"
+            echo "image=ghcr.io/$owner/$IMAGE_NAME"
+          } >> "$GITHUB_OUTPUT"
+          echo "target $build_id"
+
+      - name: Skip if already published
+        id: gate
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+          GHCR_REPO: ${{ steps.target.outputs.repo }}
+          FORCE: ${{ inputs.force }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          [ "$FORCE" = "true" ] && exit 0
+
+          # || true so a transport failure or a non-JSON body reaches the guard
+          # below instead of dying on pipefail with no annotation.
+          token=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --max-time 60 \
+            -u "x:$TOKEN" \
+            "https://ghcr.io/token?scope=repository:$GHCR_REPO:pull&service=ghcr.io" \
+            | jq -r '.token // ""' || true)
+          [ -n "$token" ] \
+            || { echo "::error::could not obtain a GHCR pull token for $GHCR_REPO"; exit 1; }
+
+          code=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --max-time 60 \
+            -o /dev/null -w '%{http_code}' -I \
+            -H "Authorization: Bearer $token" -H "Accept: $GHCR_ACCEPT" \
+            "https://ghcr.io/v2/$GHCR_REPO/manifests/$BUILD_ID" || echo 000)
+          case "$code" in
+            404) ;; # absent, including the first run before the package exists
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::$BUILD_ID is already published; re-run with force to rebuild"
+              echo "No image was built: $BUILD_ID is already published." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *) echo "::error::GHCR check for $BUILD_ID returned $code"; exit 1 ;;
+          esac
+
+      - name: Download the package
+        if: steps.gate.outputs.published != 'true'
+        id: download
+        env:
+          TARBALL: ${{ steps.target.outputs.tarball }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # --max-time is per attempt, so it has to leave room for the retries
+          # inside the job's own budget. -C - resumes rather than restarting.
+          curl -fSL --retry 3 --retry-delay 10 --retry-all-errors -C - --max-time 900 \
+            -o "$TARBALL" "$FTP_DIR/$TARBALL"
+          # There is no published digest to check against. Record what arrived so
+          # a later run can tell whether the upstream file changed underneath.
+          {
+            echo "size=$(stat -c %s "$TARBALL")"
+            echo "md5=$(md5sum "$TARBALL" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+          # A truncated download fails here rather than at run time.
+          tar -tzf "$TARBALL" > /dev/null
+
+      - name: Build the image
+        if: steps.gate.outputs.published != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The source label decides which repository GHCR links the package to,
+          # and only the linked repository's token may prune it later.
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "BUILD_ID=$BUILD_ID" \
+            --build-arg "ENGINE_SHA=${BUILD_ID##*-}" \
+            --label "org.opencontainers.image.source=$SERVER_URL/$REPOSITORY" \
+            -t "$IMAGE:$BUILD_ID" \
+            .
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+          IMAGE: ${{ steps.target.outputs.image }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+
+      - name: Smoke test
+        if: steps.gate.outputs.published != 'true'
+        id: smoke
+        timeout-minutes: 15
+        continue-on-error: true # a failed build is still published for investigation
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+          IMAGE: ${{ steps.target.outputs.image }}
+        run: bash smoke.sh "$IMAGE:$BUILD_ID" "$BUILD_ID"
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.published != 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Push the immutable tag
+        if: steps.gate.outputs.published != 'true'
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+          IMAGE: ${{ steps.target.outputs.image }}
+        run: docker push "$IMAGE:$BUILD_ID"
+
+      - name: Move nightly and latest
+        if: steps.gate.outputs.published != 'true' && steps.smoke.outcome == 'success'
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+          IMAGE: ${{ steps.target.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tag in nightly latest; do
+            docker tag "$IMAGE:$BUILD_ID" "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+
+      - name: Prune old immutable versions
+        if: steps.gate.outputs.published != 'true'
+        continue-on-error: true # housekeeping must never fail a good image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="/users/$OWNER/packages/container/$IMAGE_NAME/versions"
+          # A 404 is the legitimate "no package yet". Anything else means the
+          # prune could not even look, and must not read as nothing to prune.
+          if ! probe=$(gh api "$api?per_page=1" 2>&1); then
+            case "$probe" in
+              *"(HTTP 404)"*) echo "package $IMAGE_NAME does not exist yet, nothing to prune"; exit 0 ;;
+              *) echo "$probe"; echo "::warning::prune skipped, cannot list versions of $IMAGE_NAME"; exit 1 ;;
+            esac
+          fi
+          # Versions rank by created_at, which does not move when a tag is
+          # re-pointed. Excluding the moving tags is what stops a run of smoke
+          # failures from ageing out the image nightly still points at.
+          ids=$(gh api --paginate "$api?per_page=100" \
+                  --jq '.[] | {id, created_at, tags: (.metadata.container.tags // [])}' \
+                | jq -sr --argjson keep "$KEEP_VERSIONS" '
+                    map(select((.tags | index("nightly") | not)
+                           and (.tags | index("latest")  | not)))
+                    | sort_by(.created_at) | reverse | .[$keep:] | .[].id')
+          count=$(printf '%s' "$ids" | grep -c . || true)
+          echo "::notice::$count versions over the keep-$KEEP_VERSIONS limit"
+          for id in $ids; do
+            gh api --method DELETE "$api/$id" >/dev/null \
+              && echo "deleted version $id" \
+              || echo "::warning::could not delete version $id"
+          done
+
+      - name: Summary
+        if: always() && steps.gate.outputs.published != 'true'
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+          IMAGE: ${{ steps.target.outputs.image }}
+          TARBALL: ${{ steps.target.outputs.tarball }}
+          SIZE: ${{ steps.download.outputs.size }}
+          MD5: ${{ steps.download.outputs.md5 }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        shell: bash
+        run: |
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| build | \`$BUILD_ID\` |"
+            echo "| image | \`$IMAGE:$BUILD_ID\` |"
+            echo "| source | \`$FTP_DIR/$TARBALL\` |"
+            echo "| size | \`$SIZE\` |"
+            echo "| md5 | \`$MD5\` |"
+            echo "| smoke test | $SMOKE |"
+            echo "| nightly moved | $([ "$SMOKE" = success ] && echo yes || echo no) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a failed smoke test
+        if: steps.smoke.outcome == 'failure'
+        env:
+          BUILD_ID: ${{ steps.target.outputs.build_id }}
+        run: |
+          echo "::error::smoke test failed for $BUILD_ID; nightly was not moved"
+          exit 1
